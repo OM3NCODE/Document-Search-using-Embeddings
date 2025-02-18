@@ -1,0 +1,7 @@
+torch 
+faiss-cpu 
+numpy 
+pandas 
+pymupdf 
+pdfplumber 
+transformers
