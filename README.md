@@ -66,7 +66,6 @@ If pymupdf does not install use the below command:
 ├── 📄 README.md        # Project documentation
 ├── Bitcoin.txt      # sample documents
 ├── Covid.pdf        # sample documents
-│   
 ```
 
 ## Notes
