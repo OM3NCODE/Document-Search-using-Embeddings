@@ -61,28 +61,38 @@ def read_pdf(file_path):
 file_path = "Covid.pdf"  # Change this to your file
 documents = read_document(file_path)
 
-# Create embeddings for document
-document_embeddings = np.vstack([get_embedding(text) for text in documents])
+# Check if embeddings already exist to avoid recomputation
+embedding_file = "document_embeddings.csv"
+
+if os.path.exists(embedding_file):
+    print("🔄 Loading precomputed embeddings from CSV...")
+    df = pd.read_csv(embedding_file)
+    document_embeddings = np.vstack(df["embedding"].apply(eval))  # Convert string back to NumPy array
+else:
+    print("🛠️ Computing embeddings for documents...")
+    df = pd.DataFrame({"text": documents, "embedding": [get_embedding(text).tolist() for text in documents]})
+    df.to_csv(embedding_file, index=False)  # Save embeddings
+    document_embeddings = np.vstack(df["embedding"].values)
 
 # Build FAISS index
 dimension = document_embeddings.shape[1]
 index = faiss.IndexFlatL2(dimension)
 index.add(document_embeddings)
 
-# Function to search the document
-def search_similar(query, top_k=1):
+# Function to search and return structured results
+def search_similar(query, top_k=3):
     query_embedding = get_embedding(query)
     distances, indices = index.search(query_embedding, top_k)
 
     results = []
-    for idx in indices[0]:
-        results.append(documents[idx])
+    for i, idx in enumerate(indices[0]):
+        results.append({"Rank": i + 1, "Matched Text": df.iloc[idx]["text"], "Distance": distances[0][i]})
 
-    return results
+    return pd.DataFrame(results)  # Convert results into a DataFrame
 
 # Test search
-query = input("Enter your Query?")
-results = search_similar(query)
+query = input("Enter your Query: ")
+results_df = search_similar(query)
 
 print("\n🔍 Query:", query)
-print("🔎 Top Matches:", results)
+print("\n🔎 Top Matches:\n", results_df)
