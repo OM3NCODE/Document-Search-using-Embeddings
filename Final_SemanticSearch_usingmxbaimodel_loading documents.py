@@ -3,9 +3,11 @@ import torch
 import faiss
 import numpy as np
 import pandas as pd
-import fitz  # PyMuPDF for install [use pip install --upgrade pymupdf]
+import fitz  # PyMuPDF
 import pdfplumber
+import time
 from transformers import AutoTokenizer, AutoModel
+from sklearn.datasets import fetch_20newsgroups
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -14,85 +16,94 @@ model_name = "mixedbread-ai/mxbai-embed-large-v1"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
 
-# Function to get embeddings
-def get_embedding(text):
-    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+def get_embedding(texts):
+    # Ensure texts are strings and remove NaN values
+    texts = [str(text) if pd.notna(text) else "" for text in texts]
+    texts = [text for text in texts if text.strip()]  # Remove empty strings
+
+    if not texts:  # If the batch is empty after cleaning, return an empty array
+        return np.array([])
+
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=512)
     with torch.no_grad():
         outputs = model(**inputs)
-    return outputs.last_hidden_state[:, 0, :].numpy()  # CLS token as embedding
+    return outputs.last_hidden_state[:, 0, :].numpy()
 
-# Function to read a document (TXT, CSV, PDF)
 def read_document(file_path):
     ext = file_path.split('.')[-1].lower()
-
     if ext == "txt":
         with open(file_path, "r", encoding="utf-8") as f:
-            return f.readlines()
-    
+            return pd.DataFrame(f.readlines(), columns=["text"]).dropna()
     elif ext == "csv":
         df = pd.read_csv(file_path)
-        return df.iloc[:, 0].tolist()  # Assume first column contains text
-    
+        return df.iloc[:, [0]].dropna()  # Ensure only text column is considered
     elif ext == "pdf":
-        return read_pdf(file_path)  # Use our custom PDF reader
-
+        return read_pdf(file_path)
     else:
         raise ValueError("Unsupported file format. Use TXT, CSV, or PDF.")
 
-# Function to read a PDF using PyMuPDF and pdfplumber
 def read_pdf(file_path):
     text_data = []
-
-    # First, try extracting text with PyMuPDF
     doc = fitz.open(file_path)
     for page in doc:
         text = page.get_text("text")
-        if text.strip():  # If PyMuPDF extracts text, use it
+        if text.strip():
             text_data.append(text)
-        else:  # If PyMuPDF fails, use pdfplumber
+        else:
             with pdfplumber.open(file_path) as pdf:
                 text_plumber = pdf.pages[page.number].extract_text()
                 if text_plumber:
                     text_data.append(text_plumber)
+    return pd.DataFrame(text_data, columns=["text"]).dropna()
 
-    return text_data
+# Load a limited subset of 20 Newsgroups dataset
+newsgroups = fetch_20newsgroups(subset='all', remove=('headers', 'footers', 'quotes'))
+documents = pd.DataFrame(newsgroups.data[:650], columns=["text"]).dropna()
 
-# Load document and extract text
-file_path = "Covid.pdf"  # Change this to your file
-documents = read_document(file_path)
+# Chunking to optimize processing
+chunk_size = 1000
+documents["chunks"] = documents["text"].apply(lambda doc: [doc[i:i+chunk_size] for i in range(0, len(doc), chunk_size)])
+document_chunks = documents.explode("chunks").drop(columns=["text"]).dropna().reset_index(drop=True)
 
-# Check if embeddings already exist to avoid recomputation
-embedding_file = "document_embeddings.csv"
+# Drop NaN and empty text chunks before embedding
+document_chunks = document_chunks.dropna(subset=["chunks"]).reset_index(drop=True)
 
-if os.path.exists(embedding_file):
-    print("🔄 Loading precomputed embeddings from CSV...")
-    df = pd.read_csv(embedding_file)
-    document_embeddings = np.vstack(df["embedding"].apply(eval))  # Convert string back to NumPy array
-else:
-    print("🛠️ Computing embeddings for documents...")
-    df = pd.DataFrame({"text": documents, "embedding": [get_embedding(text).tolist() for text in documents]})
-    df.to_csv(embedding_file, index=False)  # Save embeddings
-    document_embeddings = np.vstack(df["embedding"].values)
+start_time = time.time()
 
-# Build FAISS index
-dimension = document_embeddings.shape[1]
-index = faiss.IndexFlatL2(dimension)
-index.add(document_embeddings)
+# Compute embeddings
+print("🛠️ Computing embeddings for documents...")
+batch_size = 64
+embeddings = []
+valid_indices = []
 
-# Function to search and return structured results
+for i in range(0, len(document_chunks), batch_size):
+    batch_texts = document_chunks["chunks"].iloc[i:i+batch_size].tolist()
+    batch_embeddings = get_embedding(batch_texts)
+
+    if batch_embeddings.size > 0:  # Only add non-empty embeddings
+        embeddings.extend(batch_embeddings)
+        valid_indices.extend(range(i, i + len(batch_embeddings)))  # Track valid indices
+
+# Ensure embeddings align with valid rows
+document_chunks = document_chunks.iloc[valid_indices].reset_index(drop=True)
+document_chunks["embedding"] = embeddings
+
+dimension = len(embeddings[0])
+index = faiss.IndexHNSWFlat(dimension, 32)
+index.add(np.vstack(embeddings))
+
 def search_similar(query, top_k=3):
-    query_embedding = get_embedding(query)
+    query_embedding = get_embedding([query])
     distances, indices = index.search(query_embedding, top_k)
-
-    results = []
+    print("\n🔍 Query:", query)
+    print("\n🔎 Top Matches:\n")
     for i, idx in enumerate(indices[0]):
-        results.append({"Rank": i + 1, "Matched Text": df.iloc[idx]["text"], "Distance": distances[0][i]})
+        print(f"🔥 Match {i+1}:")
+        print(document_chunks.iloc[idx]["chunks"])  # Retrieve text from DataFrame
+        print("-" * 80)
 
-    return pd.DataFrame(results)  # Convert results into a DataFrame
+end_time = time.time()
+print(f"⏳ Execution Time: {end_time - start_time:.2f} seconds")
 
-# Test search
 query = input("Enter your Query: ")
-results_df = search_similar(query)
-
-print("\n🔍 Query:", query)
-print("\n🔎 Top Matches:\n", results_df)
+search_similar(query)
